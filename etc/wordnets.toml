@@ -1,0 +1,6 @@
+# Wordnets to include in the MOW Cygnet build.
+# English (OEWN) provides the base synset structure.
+# Myanmar/Burmese is the primary resource (MOW + TUFS).
+en  = ["https://en-word.net/static/english-wordnet-2025.xml.gz"]
+my  = ["https://github.com/omwn/tufs/releases/download/2.0/tufs-my-2.0.tar.xz"]
+mya = ["https://github.com/omwn/mow/releases/latest/download/wnmow.tar.xz"]

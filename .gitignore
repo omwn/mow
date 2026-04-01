@@ -1,0 +1,6 @@
+*~
+.venv/
+build/
+external/
+docs/*.db.gz
+docs/*.db
