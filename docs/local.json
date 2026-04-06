@@ -1,13 +1,14 @@
 {
   "_comment": "Cygnet UI config for the Myanmar Open Wordnet.",
 
-  "title":   "Myanmar Open Wordnet",
-  "name":    "MOW",
-  "tagline": "A lexical resource for Myanmar/Burmese",
-  "icon":    "📖",
+    "title":   "Myanmar Open Wordnet",
+    "url":  "https://wordnet.burmese.sg/",
+    "name":    "MOW",
+    "tagline": "A lexical resource for Myanmar/Burmese",
+    "icon":    "📖",
 
-  "searchLanguage": "mya",
-  "displayLanguage": "mya",
+  "searchLanguage": "my",
+  "displayLanguage": "my",
 
   "databases": {
     "main": {
@@ -24,16 +25,21 @@
 
   "logo": {
     "src": "omw-logo.svg",
-    "url": "https://github.com/omwn/mow",
-    "alt": "Myanmar Open Wordnet",
-    "name": "MOW"
+    "url": "https://omwn.org",
+    "alt": "Open Multilingual Wordnet",
+    "name": "OMW"
   },
 
   "footer": "Myanmar Open Wordnet — CC BY 4.0.",
 
   "about": {
-    "intro": "<p>The Myanmar Open Wordnet (MOW) is a freely-available semantic dictionary of the Myanmar/Burmese language, inspired by Princeton WordNet and the Global WordNet Grid. It is part of the Open Multilingual Wordnet.</p><p>Source code on <a href='https://github.com/omwn/mow' style='text-decoration:underline'>GitHub</a>.</p>",
-    "citation": "If you use the Myanmar Open Wordnet, please cite the MOW team (2017) and Maudslay &amp; Bond (2026) for the interface.",
-    "languageData": "The Myanmar Open Wordnet covers Myanmar/Burmese (ISO 639-3: mya), linked to English via the Princeton WordNet synset hierarchy."
-  }
+    "intro": "<p>The Myanmar Open Wordnet (MOW) is a freely-available semantic dictionary of the Myanmar/Burmese language, inspired by Princeton WordNet and the Global WordNet Grid. It is part of the Open Multilingual Wordnet (Bond and Foster, 2013).</p><p>Source code on <a href='https://github.com/omwn/mow' style='text-decoration:underline'>GitHub</a>.  Licensed under CC BY 4.0.</p>",
+    "citation": "If you use the Myanmar Open Wordnet, please cite Wang Wenji (n.d.).  The interface is <b>Cygnet</b> (Maudslay &amp; Bond, 2026).",
+    "languageData": "The Myanmar Open Wordnet covers Myanmar/Burmese (my), linked to English via the Collaborative Interlingual Index.  We also show Myanmar data from the Tokyo University of Studies Basic Vocabulary and English from the Open English wordnet."
+  },
+
+    "publications": [
+    "Rowan Hall Maudslay &amp; Francis Bond (2026). Cygnet: Refactoring the Open Multilingual Wordnet. In <em>Proceedings of the 15th International Conference on Language Resources and Evaluation (LREC 2026)</em>. (to appear)",
+	"Francis Bond &amp; Ryan Foster (2013). <a href='https://aclanthology.org/P13-1133/' style='text-decoration:underline'>Linking and extending an open multilingual wordnet</a>. In <em>Proceedings of the 51st Annual Meeting of the Association for Computational Linguistics (ACL 2013)</em>. Sofia. pp. 1352–1362."
+  ]   
 }

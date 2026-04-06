@@ -68,7 +68,7 @@ python3 tsv2lmf.py \
     "$OLDPWD/$DESTINATION" \
     --id='mow' \
     --label='Myanmar Open Wordnet' \
-    --language='mya' \
+    --language='my' \
     --version="$VERSION" \
     --email='bond@ieee.org' \
     --license='https://creativecommons.org/licenses/by/4.0/' \

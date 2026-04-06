@@ -1,1 +1,1 @@
-Myanmar Open Wordnet. (2017). Myanmar Open Wordnet. wordnet.burmese.sg. CC BY 4.0.
+Wenjie Wang. n.d. Myanmar Open Wordnet (MOW). Accessed 2026-04-01. https://wordnet.burmese.sg/

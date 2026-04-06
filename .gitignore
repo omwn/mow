@@ -4,3 +4,4 @@ build/
 external/
 docs/*.db.gz
 docs/*.db
+docs/wordnets.toml
