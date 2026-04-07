@@ -35,7 +35,7 @@
   "about": {
     "intro": "<p>The Myanmar Open Wordnet (MOW) is a freely-available semantic dictionary of the Myanmar/Burmese language, inspired by Princeton WordNet and the Global WordNet Grid. It is part of the Open Multilingual Wordnet (Bond and Foster, 2013).</p><p>Source code on <a href='https://github.com/omwn/mow' style='text-decoration:underline'>GitHub</a>.  Licensed under CC BY 4.0.</p>",
     "citation": "If you use the Myanmar Open Wordnet, please cite Wang Wenji (n.d.).  The interface is <b>Cygnet</b> (Maudslay &amp; Bond, 2026).",
-    "languageData": "The Myanmar Open Wordnet covers Myanmar/Burmese (my), linked to English via the Collaborative Interlingual Index.  We also show Myanmar data from the Tokyo University of Studies Basic Vocabulary and English from the Open English wordnet."
+    "languageData": "The Myanmar Open Wordnet covers Myanmar/Burmese (my), linked to English (en) via the Collaborative Interlingual Index.  We also show Myanmar data from the Tokyo University of Studies Basic Vocabulary and English from the Open English Wordnet."
   },
 
     "publications": [

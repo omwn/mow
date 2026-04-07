@@ -33,7 +33,7 @@
         // Loaded from local.json at startup; falls back silently if absent.
         // See notes/local.json.example for supported fields.
         let _siteConfig = {};
-        const _configPromise = fetch('local.json')
+        const _configPromise = fetch('local.json', { cache: 'no-cache' })
             .then(r => r.ok ? r.json() : {})
             .catch(() => ({}))
             .then(cfg => {
@@ -211,7 +211,7 @@
             const lemma = lemmaForm?.form || '';
             const variants = forms.filter(f => f.rank > 0).map(f => f.form);
             const pronunciations = lemmaForm ? cachedExec(`
-                SELECT variety, pronunciation FROM pronunciations
+                SELECT variety, pronunciation, audio FROM pronunciations
                 WHERE form_rowid = ? ORDER BY rowid
             `, [lemmaForm.rowid]) : [];
 
@@ -398,6 +398,25 @@
         }
 
         const _labelCache = {};
+        const _summaryCache = {};
+        let _hasCoreTable = null;
+
+        async function readChunksToUint8Array(reader, onProgress) {
+            const chunks = [];
+            let total = 0;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                total += value.length;
+                onProgress?.(total);
+            }
+            const out = new Uint8Array(total);
+            let off = 0;
+            for (const c of chunks) { out.set(c, off); off += c.length; }
+            return out;
+        }
+
         function getConceptLabel(synsetRowid, lang = 'en') {
             const key = `${synsetRowid}-${lang}`;
             if (_labelCache[key] !== undefined) return _labelCache[key];
@@ -494,6 +513,161 @@
             );
         }
 
+        function queryWordnetSummary(code, langCode) {
+            const _cacheKey = `${code}:${langCode}`;
+            if (_summaryCache[_cacheKey]) return _summaryCache[_cacheKey];
+            const result = { posStats: null, iliPct: null, defCount: null, exCount: null, examples: [], relDist: [], senseRelDist: [] };
+            if (!_provDb || !_db) return result;
+            try {
+                const sensesTableRow = cachedExecProv(`SELECT rowid FROM prov_tables WHERE name = 'senses'`)[0];
+                if (!sensesTableRow) { _summaryCache[_cacheKey] = result; return result; }
+                const sensesTable = sensesTableRow.rowid;
+                const senseRows = cachedExecProv(
+                    `SELECT p.item_rowid FROM provenance p
+                     JOIN prov_resources pr ON p.resource_rowid = pr.rowid
+                     WHERE p.table_rowid = ? AND pr.code = ?`,
+                    [sensesTable, code]
+                );
+                if (!senseRows.length) { _summaryCache[_cacheKey] = result; return result; }
+
+                _db.exec(`CREATE TEMP TABLE IF NOT EXISTS _wnsum_senses (id INTEGER PRIMARY KEY)`);
+                _db.exec(`DELETE FROM _wnsum_senses`);
+                const rowids = senseRows.map(r => r.item_rowid);
+                for (let i = 0; i < rowids.length; i += 500) {
+                    const vals = rowids.slice(i, i + 500).map(r => `(${r})`).join(',');
+                    _db.exec(`INSERT OR IGNORE INTO _wnsum_senses VALUES ${vals}`);
+                }
+
+                const posRows = cachedExec(`
+                    WITH src AS (
+                        SELECT DISTINCT s.synset_rowid
+                        FROM senses s WHERE s.rowid IN (SELECT id FROM _wnsum_senses)
+                    )
+                    SELECT syn.pos, COUNT(*) AS cnt,
+                           SUM(CASE WHEN syn.ili IS NOT NULL THEN 1 ELSE 0 END) AS with_ili
+                    FROM src JOIN synsets syn ON syn.rowid = src.synset_rowid
+                    GROUP BY syn.pos ORDER BY cnt DESC
+                `);
+                if (posRows.length) {
+                    result.posStats = posRows.map(r => ({ pos: r.pos, cnt: r.cnt, withIli: r.with_ili }));
+                    const total = posRows.reduce((s, r) => s + r.cnt, 0);
+                    const withIli = posRows.reduce((s, r) => s + r.with_ili, 0);
+                    result.iliPct = total > 0 ? Math.round(100 * withIli / total) : 0;
+                }
+
+                const countRow = cachedExec(`
+                    SELECT COUNT(*) AS ex_count
+                    FROM sense_examples se
+                    WHERE se.sense_rowid IN (SELECT id FROM _wnsum_senses)
+                `)[0];
+                if (countRow) result.exCount = countRow.ex_count;
+
+                const defTableRow = cachedExecProv(
+                    `SELECT rowid FROM prov_tables WHERE name = 'definitions'`
+                )[0];
+                if (defTableRow) {
+                    const defCountRow = cachedExecProv(
+                        `SELECT COUNT(*) AS cnt FROM provenance p
+                         JOIN prov_resources pr ON p.resource_rowid = pr.rowid
+                         WHERE p.table_rowid = ? AND pr.code = ?`,
+                        [defTableRow.rowid, code]
+                    )[0];
+                    if (defCountRow) result.defCount = defCountRow.cnt;
+                }
+
+                const hasCore = !!_hasCoreTable;
+                const coreExJoin = hasCore ? 'LEFT JOIN core_synsets cs ON cs.synset_rowid = syn.rowid' : '';
+                const coreExOrder = hasCore ? '(cs.synset_rowid IS NULL),' : '';
+                const coreRelJoin = hasCore ? 'LEFT JOIN core_synsets cs ON cs.synset_rowid = sr.source_rowid' : '';
+                const coreRelOrder = hasCore ? '(cs.synset_rowid IS NULL),' : '';
+
+                const lang = langCode || 'en';
+                result.examples = cachedExec(`
+                    WITH src_senses AS (
+                        SELECT s.rowid, s.synset_rowid, s.sense_index, s.entry_rowid
+                        FROM senses s WHERE s.rowid IN (SELECT id FROM _wnsum_senses)
+                    ),
+                    ranked AS (
+                        SELECT syn.pos, f.form, syn.rowid AS synset_rowid,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY syn.pos
+                                   ORDER BY ${coreExOrder}
+                                            (CASE WHEN UNICODE(SUBSTR(f.form,1,1)) BETWEEN 97 AND 122
+                                                       OR UNICODE(SUBSTR(f.form,1,1)) >= 128 THEN 0 ELSE 1 END),
+                                            ss.sense_index, f.form
+                               ) AS rn
+                        FROM src_senses ss
+                        JOIN synsets syn ON syn.rowid = ss.synset_rowid
+                        JOIN entries e ON e.rowid = ss.entry_rowid
+                        JOIN forms f ON f.entry_rowid = e.rowid AND f.rank = 0
+                        JOIN languages l ON l.rowid = e.language_rowid
+                        ${coreExJoin}
+                        WHERE l.code = ?
+                    )
+                    SELECT pos, form, synset_rowid FROM ranked WHERE rn <= 5 ORDER BY pos, rn
+                `, [lang]);
+
+                const inverseTypes = new Set(
+                    Object.entries(_relConfig)
+                        .filter(([, e]) => e.short?.startsWith('-'))
+                        .map(([name]) => name)
+                );
+                const relRows = cachedExec(`
+                    WITH src AS (
+                        SELECT DISTINCT s.synset_rowid
+                        FROM senses s WHERE s.rowid IN (SELECT id FROM _wnsum_senses)
+                    ),
+                    rels AS (
+                        SELECT rt.type, sr.source_rowid, sr.target_rowid,
+                               COUNT(*) OVER (PARTITION BY rt.type) AS cnt,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY rt.type
+                                   ORDER BY ${coreRelOrder}
+                                            (CASE WHEN NOT EXISTS(
+                                                SELECT 1 FROM senses s2
+                                                JOIN entries e2 ON e2.rowid = s2.entry_rowid
+                                                JOIN languages l2 ON l2.rowid = e2.language_rowid
+                                                WHERE s2.synset_rowid = sr.target_rowid AND l2.code = ?
+                                            ) THEN 1 ELSE 0 END),
+                                            sr.rowid
+                               ) AS rn
+                        FROM synset_relations sr
+                        JOIN src ON src.synset_rowid = sr.source_rowid
+                        JOIN relation_types rt ON rt.rowid = sr.type_rowid
+                        ${coreRelJoin}
+                    )
+                    SELECT type, cnt, source_rowid AS ex_src_rowid, target_rowid AS ex_tgt_rowid
+                    FROM rels WHERE rn = 1
+                    ORDER BY cnt DESC
+                `, [lang]);
+                result.relDist = relRows.filter(row => !inverseTypes.has(row.type));
+
+                const senseRelRows = cachedExec(`
+                    WITH rels AS (
+                        SELECT rt.type,
+                               sr.source_rowid, sr.target_rowid,
+                               COUNT(*) OVER (PARTITION BY rt.type) AS cnt,
+                               ROW_NUMBER() OVER (PARTITION BY rt.type ORDER BY sr.rowid) AS rn
+                        FROM sense_relations sr
+                        JOIN _wnsum_senses ws ON ws.id = sr.source_rowid
+                        JOIN relation_types rt ON rt.rowid = sr.type_rowid
+                    )
+                    SELECT r.type, r.cnt, r.source_rowid AS ex_src_rowid, r.target_rowid AS ex_tgt_rowid,
+                           (SELECT f.form FROM forms f WHERE f.entry_rowid =
+                               (SELECT entry_rowid FROM senses WHERE rowid = r.source_rowid) AND f.rank = 0 LIMIT 1) AS src_form,
+                           (SELECT f.form FROM forms f WHERE f.entry_rowid =
+                               (SELECT entry_rowid FROM senses WHERE rowid = r.target_rowid) AND f.rank = 0 LIMIT 1) AS tgt_form
+                    FROM rels r WHERE rn = 1
+                    ORDER BY cnt DESC
+                `);
+                result.senseRelDist = senseRelRows.filter(row => !inverseTypes.has(row.type));
+            } catch (e) {
+                console.error('queryWordnetSummary error:', e);
+            }
+            _summaryCache[_cacheKey] = result;
+            return result;
+        }
+
         // ========== INDEXEDDB CACHE ==========
         const IDB_NAME = 'cygnet-cache';
         const IDB_STORE = 'blobs';
@@ -579,9 +753,7 @@
             const [showPronunciation, setShowPronunciation] = useState(() =>
                 localStorage.getItem('showPronunciation') !== 'false'
             );
-            const [highlightedResource, setHighlightedResource] = useState(null);
-            const highlightedRowRef = useRef(null);
-            const [infoPopup, setInfoPopup] = useState(null);
+            const [selectedWordnet, setSelectedWordnet] = useState(null);
             const [searchTerm, setSearchTerm] = useState('');
             const [currentSearch, setCurrentSearch] = useState('');
             const [currentSearchSenseIds, setCurrentSearchSenseIds] = useState(new Set());
@@ -615,6 +787,7 @@
             const [pathTargetRowid, setPathTargetRowid] = useState(null);
             const [pathResult, setPathResult] = useState(null);
             const [pathNotFound, setPathNotFound] = useState(false);
+            const [pathWordSuggestions, setPathWordSuggestions] = useState([]);
             const isPopStateRef = useRef(false);
             const isInitialLoadRef = useRef(true);
             const initialUrlHandledRef = useRef(false);
@@ -633,6 +806,8 @@
             const hoveredNodeRef = useRef(null);
             const nodeSizeCache = useRef(new Map());
             const MAX_CACHE_SIZE = 200;
+            const tooltipTimerRef = useRef(null);
+            const [conceptTooltip, setConceptTooltip] = useState(null); // { id, x, y }
 
             const addToCache = (key, value) => {
                 const cache = nodeSizeCache.current;
@@ -663,7 +838,11 @@
                     if (icon) {
                         let link = document.querySelector("link[rel='icon']");
                         if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }
-                        link.href = `data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>${encodeURIComponent(icon)}</text></svg>`;
+                        if (icon.includes('.')) {
+                            link.href = icon;
+                        } else {
+                            link.href = `data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>${encodeURIComponent(icon)}</text></svg>`;
+                        }
                     }
                     if (displayLanguage && !localStorage.getItem('definitionLanguage')) {
                         setDefinitionLanguage(displayLanguage);
@@ -698,7 +877,7 @@
                                     stale = true;
                                 } else {
                                     try {
-                                        const head = await fetch(DB_BASE + dbFile, { method: 'HEAD' });
+                                        const head = await fetch(DB_BASE + dbFile, { method: 'HEAD', cache: 'no-cache' });
                                         const serverMtime = head.headers.get('last-modified') || head.headers.get('etag');
                                         const cachedMtime = await idbGet('db-mtime');
                                         if (serverMtime && serverMtime !== cachedMtime) stale = true;
@@ -709,11 +888,31 @@
                                     await Promise.all([
                                         idbDel('db'), idbDel('provdb'),
                                         idbDel('db-mtime'), idbDel('db-filename'),
-                                        idbDel('provdb-filename'),
+                                        idbDel('provdb-filename'), idbDel('db-compressed'),
                                     ]);
                                 } else {
                                     setDbProgress('Loading from cache...');
-                                    buf = new Uint8Array(cached);
+                                    const isCompressed = await idbGet('db-compressed');
+                                    if (isCompressed) {
+                                        setDbProgress('Decompressing...');
+                                        const ds = new DecompressionStream('gzip');
+                                        const writer = ds.writable.getWriter();
+                                        const reader = ds.readable.getReader();
+                                        writer.write(new Uint8Array(cached));
+                                        writer.close();
+                                        const chunks = [];
+                                        while (true) {
+                                            const { done, value } = await reader.read();
+                                            if (done) break;
+                                            chunks.push(value);
+                                        }
+                                        const total = chunks.reduce((s, c) => s + c.length, 0);
+                                        buf = new Uint8Array(total);
+                                        let off = 0;
+                                        for (const ch of chunks) { buf.set(ch, off); off += ch.length; }
+                                    } else {
+                                        buf = new Uint8Array(cached);
+                                    }
                                 }
                             }
                         } catch (e) {
@@ -721,58 +920,61 @@
                         }
 
                         if (!buf) {
-                            // Fetch compressed database
                             setDbProgress('Downloading database...');
-                            const response = await fetch(DB_BASE + dbFile);
+                            const response = await fetch(DB_BASE + dbFile, { cache: 'reload' });
                             if (!response.ok) throw new Error(`Failed to fetch database: ${response.status}`);
                             const serverMtime = response.headers.get('last-modified') || response.headers.get('etag') || '';
                             const compressedTotal = parseInt(response.headers.get('content-length') || '0');
 
-                            // Stream through DecompressionStream
-                            const ds = new DecompressionStream('gzip');
-                            const decompressedStream = response.body.pipeThrough(ds);
-                            const reader = decompressedStream.getReader();
+                            // Touch-primary devices store compressed (~130 MB); desktops store
+                            // uncompressed (~340 MB) so new tabs can load without re-decompressing.
+                            const isMobile = window.matchMedia('(hover: none) and (pointer: coarse)').matches;
 
-                            // We track compressed bytes via a wrapper on the original body
-                            // But DecompressionStream consumes the body, so we track decompressed bytes
-                            let loaded = 0;
-                            const chunks = [];
-                            while (true) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                chunks.push(value);
-                                loaded += value.length;
-                                if (compressedTotal > 0) {
-                                    // Estimate: show decompressed MB (compressed size known for reference)
-                                    setDbProgress('Downloading & decompressing...');
-                                    setDownloadProgress({ loaded, total: null, compressedTotal });
-                                } else {
-                                    setDbProgress(`Decompressing... ${(loaded/1048576).toFixed(0)} MB`);
-                                }
-                            }
-
-                            buf = new Uint8Array(loaded);
-                            let offset = 0;
-                            for (const chunk of chunks) {
-                                buf.set(chunk, offset);
-                                offset += chunk.length;
-                            }
-                            setDownloadProgress(null);
-
-                            // Cache in IndexedDB
-                            setDbProgress('Caching for next visit...');
-                            try {
-                                await idbPut('db', buf.buffer);
-                                await idbPut('db-filename', dbFile);
-                                if (serverMtime) await idbPut('db-mtime', serverMtime);
-                            } catch (e) {
-                                console.warn('IndexedDB cache write failed:', e);
+                            if (isMobile) {
+                                // Mobile: cache compressed to save device storage.
+                                setDbProgress('Downloading...');
+                                const compressedBuf = await response.arrayBuffer();
+                                setDbProgress('Decompressing...');
+                                const ds = new DecompressionStream('gzip');
+                                const writer = ds.writable.getWriter();
+                                const reader = ds.readable.getReader();
+                                writer.write(new Uint8Array(compressedBuf));
+                                writer.close();
+                                buf = await readChunksToUint8Array(reader);
+                                setDbProgress('Caching for next visit...');
+                                try {
+                                    await idbPut('db', compressedBuf);
+                                    await idbPut('db-compressed', true);
+                                    await idbPut('db-filename', dbFile);
+                                    if (serverMtime) await idbPut('db-mtime', serverMtime);
+                                } catch (e) { console.warn('IndexedDB cache write failed:', e); }
+                            } else {
+                                // Desktop: stream-decompress and cache uncompressed.
+                                const ds = new DecompressionStream('gzip');
+                                const reader = response.body.pipeThrough(ds).getReader();
+                                buf = await readChunksToUint8Array(reader, (loaded) => {
+                                    if (compressedTotal > 0) {
+                                        setDbProgress('Downloading & decompressing...');
+                                        setDownloadProgress({ loaded, total: null, compressedTotal });
+                                    } else {
+                                        setDbProgress(`Decompressing... ${(loaded/1048576).toFixed(0)} MB`);
+                                    }
+                                });
+                                setDownloadProgress(null);
+                                setDbProgress('Caching for next visit...');
+                                try {
+                                    await idbPut('db', buf.buffer);
+                                    await idbDel('db-compressed');
+                                    await idbPut('db-filename', dbFile);
+                                    if (serverMtime) await idbPut('db-mtime', serverMtime);
+                                } catch (e) { console.warn('IndexedDB cache write failed:', e); }
                             }
                         }
 
                         setDbProgress('Opening database...');
                         _SQL = SQL;
                         _db = new SQL.Database(buf);
+                        _hasCoreTable = cachedExec(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='core_synsets'`).length > 0;
                         buildLangNames();
                         setAllLanguages(getAllLanguages());
                         setAllResources(queryResources());
@@ -981,7 +1183,7 @@
                     }
 
                     if (!buf) {
-                        const response = await fetch(DB_BASE + provFile);
+                        const response = await fetch(DB_BASE + provFile, { cache: 'reload' });
                         if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
                         const ds = new DecompressionStream('gzip');
                         const reader = response.body.pipeThrough(ds).getReader();
@@ -1021,12 +1223,6 @@
             }, [definitionLanguage]);
 
             useEffect(() => {
-                if (activeTab === 'wordnets' && highlightedResource && highlightedRowRef.current) {
-                    highlightedRowRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                }
-            }, [activeTab, highlightedResource]);
-
-            useEffect(() => {
                 if (view === 'concept') window.scrollTo(0, 0);
             }, [view, selectedConcept]);
 
@@ -1037,7 +1233,9 @@
                 if (isPopStateRef.current) { isPopStateRef.current = false; return; }
 
                 let newUrl;
-                if (activeTab !== 'browser') {
+                if (activeTab === 'wordnets' && selectedWordnet) {
+                    newUrl = `#/wordnet/${selectedWordnet}`;
+                } else if (activeTab !== 'browser') {
                     newUrl = `#/${activeTab}`;
                 } else if (view === 'search') {
                     const params = new URLSearchParams();
@@ -1056,7 +1254,7 @@
                 if (newUrl && newUrl !== window.location.hash) {
                     window.history.pushState({}, '', newUrl);
                 }
-            }, [view, currentSearch, languageFilter, posFilter, senseFilter, selectedConcept, selectedSense, dbReady, activeTab, definitionLanguage]);
+            }, [view, currentSearch, languageFilter, posFilter, senseFilter, selectedConcept, selectedSense, dbReady, activeTab, definitionLanguage, selectedWordnet]);
 
             // Handle popstate
             useEffect(() => {
@@ -1065,8 +1263,13 @@
                     const hash = window.location.hash.slice(1);
                     const [path, queryString] = hash.split('?');
 
-                    if (['about', 'publications', 'wordnets'].includes(path?.replace('/', ''))) {
-                        setActiveTab(path.replace('/', ''));
+                    const tabPath = path?.replace('/', '');
+                    if (['about', 'publications', 'wordnets'].includes(tabPath)) {
+                        setActiveTab(tabPath);
+                        setSelectedWordnet(null);
+                    } else if (tabPath?.startsWith('wordnet/')) {
+                        setActiveTab('wordnets');
+                        setSelectedWordnet(tabPath.slice('wordnet/'.length));
                     } else {
                         setActiveTab('browser');
                         const params = new URLSearchParams(queryString || '');
@@ -1227,8 +1430,35 @@
             };
 
             // Navigation handlers
+            const conceptHref = (id) => `#/search?concept=${id}`;
+            const senseHref = (id) => `#/search?sense=${id}`;
+            const onConceptLinkClick = (e, id) => {
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                handleConceptClick(id);
+            };
+            const onSenseLinkClick = (e, id) => {
+                if (e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                handleSenseClick(id);
+            };
+
+            const showTooltip = (id, e) => {
+                if (tooltipTimerRef.current) clearTimeout(tooltipTimerRef.current);
+                const x = e.clientX, y = e.clientY;
+                tooltipTimerRef.current = setTimeout(() => {
+                    if (!loadedConcepts[id.toString()]) loadConcept(id.toString());
+                    setConceptTooltip({ id: parseInt(id), x, y });
+                }, 300);
+            };
+            const hideTooltip = () => {
+                if (tooltipTimerRef.current) { clearTimeout(tooltipTimerRef.current); tooltipTimerRef.current = null; }
+                setConceptTooltip(null);
+            };
+
             const handleConceptClick = (conceptId) => {
                 nodeSizeCache.current.clear();
+                hideTooltip();
                 setSelectedConcept(conceptId.toString());
                 setSelectedSense(null);
                 setView('concept');
@@ -1242,6 +1472,7 @@
             };
 
             const handleSenseClick = (senseId) => {
+                hideTooltip();
                 setSelectedSense(senseId.toString());
                 setSelectedConcept(null);
                 setView('sense');
@@ -1341,7 +1572,7 @@
                             <span key={s.code + (s.version || '')}>
                                 {i > 0 && ', '}
                                 <button
-                                    onClick={() => { setHighlightedResource(s.code); setActiveTab('wordnets'); }}
+                                    onClick={() => { setSelectedWordnet(s.code); setActiveTab('wordnets'); }}
                                     className="hover:text-blue-500 hover:underline"
                                 >{s.code}{s.version ? `:${s.version}` : ''}</button>
                             </span>
@@ -1358,14 +1589,14 @@
                 const rest = rows.slice(1);
                 return (
                     <span className="relative inline-block group text-xs text-gray-400 ml-1 cursor-default">
-                        (<button onClick={() => { setHighlightedResource(first.code); setActiveTab('wordnets'); }}
+                        (<button onClick={() => { setSelectedWordnet(first.code); setActiveTab('wordnets'); }}
                             className="hover:text-blue-500 hover:underline">
                             {first.code}{first.version ? `:${first.version}` : ''}
                         </button>{rest.length > 0 && <span> +{rest.length}</span>})
                         {rest.length > 0 && (
                             <span className="absolute bottom-full left-0 hidden group-hover:flex flex-col bg-white border border-gray-200 rounded shadow-lg text-xs p-1.5 z-10 whitespace-nowrap gap-0.5">
                                 {rows.map((s, i) => (
-                                    <button key={i} onClick={() => { setHighlightedResource(s.code); setActiveTab('wordnets'); }}
+                                    <button key={i} onClick={() => { setSelectedWordnet(s.code); setActiveTab('wordnets'); }}
                                         className="text-left hover:text-blue-500 hover:underline">
                                         {s.code}{s.version ? `:${s.version}` : ''}
                                     </button>
@@ -1382,7 +1613,8 @@
                     <div className="text-xs text-gray-500 font-normal mt-0.5">
                         {prons.map((p, i) => (
                             <span key={i} className="mr-3">
-                                /{p.pronunciation}/{p.variety && <sup className="ml-0.5">{p.variety}</sup>}
+                                {p.pronunciation && <span title={p.variety || undefined}>/{p.pronunciation}/</span>}
+                                {p.audio && <button onClick={() => new Audio(p.audio).play()} title={p.variety || 'Play audio'} className="ml-1 hover:text-blue-500">🔊</button>}
                             </span>
                         ))}
                     </div>
@@ -1768,11 +2000,11 @@
                                 <div className="flex items-center gap-3">
                                     {siteConfig.url
                                         ? <a href={siteConfig.url} target="_blank" rel="noopener noreferrer" className="hover:opacity-80 flex items-center gap-1.5">
-                                              {siteConfig.icon && <h1 className="text-4xl -mt-0.5">{siteConfig.icon}</h1>}
+                                              {siteConfig.icon && (siteConfig.icon.includes('.') ? <img src={siteConfig.icon} alt="" className="h-10" /> : <h1 className="text-4xl -mt-0.5">{siteConfig.icon}</h1>)}
                                               {siteConfig.title && <h1 className="text-3xl font-bold text-gray-800"> {siteConfig.title}</h1>}
                                           </a>
                                         : <button onClick={handleLogoClick} className="text-left hover:opacity-80 flex items-center gap-1.5">
-                                              {siteConfig.icon && <h1 className="text-4xl -mt-0.5">{siteConfig.icon}</h1>}
+                                              {siteConfig.icon && (siteConfig.icon.includes('.') ? <img src={siteConfig.icon} alt="" className="h-10" /> : <h1 className="text-4xl -mt-0.5">{siteConfig.icon}</h1>)}
                                               {siteConfig.title && <h1 className="text-3xl font-bold text-gray-800"> {siteConfig.title}</h1>}
                                           </button>
                                     }
@@ -1794,15 +2026,15 @@
                                 )}
                             </div>
                             <nav className="flex items-end gap-3 mt-3 -mb-3 flex-wrap">
-                                {['browser', 'about', 'publications', 'wordnets'].map(tab => (
+                                {[['browser','Browse'],['about','About'],['publications','Publications'],['wordnets','Wordnets']].map(([tab, label]) => (
                                     <button key={tab}
-                                        onClick={() => setActiveTab(tab)}
+                                        onClick={() => { setActiveTab(tab); if (tab === 'wordnets') setSelectedWordnet(null); }}
                                         className={`px-4 py-2 rounded-t-lg border-b-2 transition-colors ${
                                             activeTab === tab
                                                 ? 'bg-gray-50 border-blue-500 text-blue-700 font-medium'
                                                 : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'
                                         }`}
-                                    >{tab.charAt(0).toUpperCase() + tab.slice(1)}</button>
+                                    >{label}</button>
                                 ))}
                                 <div className="flex items-center gap-1.5 flex-grow min-w-48 pb-0.5">
                                     <input type="text" value={searchTerm}
@@ -1812,22 +2044,22 @@
                                         disabled={!dbReady}
                                         className="flex-grow min-w-0 px-3 py-1.5 text-sm border border-gray-300 rounded disabled:opacity-50"
                                     />
-                                    <div className="relative group flex-shrink-0">
-                                        <button className="w-6 h-6 rounded-full border border-gray-400 text-gray-500 text-xs font-bold hover:border-blue-500 hover:text-blue-500 flex items-center justify-center">ℹ</button>
-                                        <div className="absolute right-0 top-full mt-1 hidden group-hover:block bg-white border border-gray-200 rounded shadow-lg p-3 text-xs text-gray-700 z-30 w-64 space-y-1.5">
-                                            <div><span className="font-mono font-semibold">word</span> — exact match</div>
-                                            <div><span className="font-mono font-semibold">hot*</span> or <span className="font-mono font-semibold">*ness</span> — glob (<span className="font-mono">*</span> = any characters, <span className="font-mono">?</span> = one)</div>
-                                            <div><span className="font-mono font-semibold">i1234</span> or <span className="font-mono font-semibold">cili.i1234</span> — look up concept by ILI</div>
-                                            <div><span className="font-mono font-semibold">def:word</span> — search inside definitions</div>
-                                        </div>
-                                    </div>
                                 </div>
-                                <div className="relative pb-0" ref={helpRef}>
+                                <div className="relative pb-0 group" ref={helpRef}>
                                     <button onClick={() => setHelpOpen(o => !o)}
                                         title="Help"
                                         className={`px-3 py-2 rounded-t-lg border-b-2 transition-colors ${helpOpen ? 'bg-gray-50 border-blue-500 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'}`}>
                                         ?
                                     </button>
+                                    {!helpOpen && (
+                                        <div className="absolute right-0 top-full mt-1 hidden group-hover:block bg-white border border-gray-200 rounded shadow-lg p-3 text-xs text-gray-700 z-30 w-64 space-y-1.5">
+                                            <div><span className="font-mono font-semibold">word</span> — exact match</div>
+                                            <div><span className="font-mono font-semibold">hot*</span> or <span className="font-mono font-semibold">*ness</span> — glob (<span className="font-mono">*</span> = any characters, <span className="font-mono">?</span> = one)</div>
+                                            <div><span className="font-mono font-semibold">i1234</span> or <span className="font-mono font-semibold">cili.i1234</span> — look up concept by ILI</div>
+                                            <div><span className="font-mono font-semibold">def:word</span> — search inside definitions</div>
+                                            <div className="pt-1 border-t border-gray-100 text-gray-400 italic">Click for more</div>
+                                        </div>
+                                    )}
                                     {helpOpen && (
                                         <div className="absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded shadow-lg z-20 w-80 p-4 text-sm text-gray-700 space-y-3">
                                             <p>Type in the search box and press <kbd className="px-1 py-0.5 bg-gray-100 border border-gray-300 rounded text-xs">Enter</kbd> to search. Results are <strong>senses</strong> — a word in a specific meaning. Click a sense to open its <strong>concept view</strong>, which shows relations (hypernyms, hyponyms, …) and lexicalizations across all languages.</p>
@@ -1847,7 +2079,7 @@
                                 </div>
                                 <div className="relative pb-0" ref={settingsRef}>
                                     <button onClick={() => setSettingsOpen(o => !o)}
-                                        title="Settings"
+                                        title="Settings" aria-label="Settings"
                                         className={`px-3 py-2 rounded-t-lg border-b-2 transition-colors relative ${settingsOpen ? 'bg-gray-50 border-blue-500 text-blue-700' : 'border-transparent text-gray-600 hover:text-gray-900 hover:bg-gray-50'}`}>
                                         ⚙
                                         {hasActiveSettings && <span className="absolute top-1.5 right-1 w-1.5 h-1.5 bg-blue-500 rounded-full" />}
@@ -1897,7 +2129,7 @@
                                                                     if (e.target.checked && !_provDb && !provLoading) loadProvenanceDb();
                                                                 }}
                                                                 className="cursor-pointer" />
-                                                            <span className="text-sm text-gray-600">Show provenance</span>
+                                                            <span className="text-sm text-gray-600">Show sources</span>
                                                             {showProvenance && provLoading && <span className="text-xs text-gray-400 ml-1">Loading...</span>}
                                                             {showProvenance && provError && <span className="text-xs text-red-500 ml-1">{provError}</span>}
                                                         </label>
@@ -1989,7 +2221,7 @@
                                 {!dbReady && !dbError && (
                                     <div className="flex justify-center mt-16">
                                         <div className="text-center w-72">
-                                            {siteConfig.icon && <h1 className="text-4xl mb-4">{siteConfig.icon}</h1>}
+                                            {siteConfig.icon && (siteConfig.icon.includes('.') ? <img src={siteConfig.icon} alt="" className="h-16 mx-auto mb-2" /> : <h1 className="text-4xl mb-4">{siteConfig.icon}</h1>)}
                                             <p className="text-gray-600 mb-3">{dbProgress || 'Initializing...'}</p>
                                             {downloadProgress && (
                                                 <div>
@@ -2116,7 +2348,11 @@
                                                                                                                     <strong className="text-base">{sense.l}<sub>{sense.ind}</sub></strong>
                                                                                                                     {renderPronunciations(sense.p)}
                                                                                                                 </div>
-                                                                                                                <div onClick={(e) => { e.stopPropagation(); handleConceptClick(group.conceptId); }}
+                                                                                                                <a href={conceptHref(group.conceptId)}
+                                                                                                                    onClick={(e) => { e.stopPropagation(); onConceptLinkClick(e, group.conceptId); }}
+                                                                                                                    onMouseEnter={e => showTooltip(group.conceptId, e)}
+                                                                                                                    onMouseLeave={hideTooltip}
+                                                                                                                    style={{textDecoration:'none',color:'inherit'}}
                                                                                                                     className="bg-white px-2 py-1 rounded border border-gray-300 hover:border-blue-400 hover:shadow-sm transition-all text-left cursor-pointer flex-shrink concept-inner flex items-start gap-2">
                                                                                                                     <span className="text-base flex-1">
                                                                                                                         {(() => { const li = getConceptLabel(parseInt(group.conceptId), definitionLanguage); return li ? <><span className="font-semibold text-gray-800">{li.form}</span>{<LangBadge lang={li.lang} currentLang={definitionLanguage} ml="ml-0.5" />}{' · '}</> : null; })()}
@@ -2139,7 +2375,7 @@
                                                                                                                             </a>
                                                                                                                         );
                                                                                                                     })()}
-                                                                                                                </div>
+                                                                                                                </a>
                                                                                                             </div>
                                                                                                             {hasExtra && (
                                                                                                                 <div className="text-gray-500 text-sm pt-1 flex-shrink-0">
@@ -2236,6 +2472,10 @@
 
                                     const conceptLabelInfo = getConceptLabel(parseInt(selectedConcept), definitionLanguage);
                                     const conceptLabel = conceptLabelInfo?.form || '';
+                                    const isCoreConcept = _hasCoreTable && cachedExec(
+                                        'SELECT 1 FROM core_synsets WHERE synset_rowid = ?',
+                                        [parseInt(selectedConcept)]
+                                    ).length > 0;
 
                                     return (
                                         <div>
@@ -2243,7 +2483,7 @@
                                             <div className="mb-4 flex gap-4 items-start">
                                                 <div className="flex-1">
                                                     <p className="text-base">
-                                                        {conceptLabel && <><span className="font-medium">{conceptLabel}</span>{' · '}</>}<span className="text-gray-600 italic">{getPosName(concept.oc)}</span>{' · '}
+                                                        {conceptLabel && <><span className="font-medium">{conceptLabel}</span>{' · '}</>}<span className="text-gray-600 italic">{getPosName(concept.oc)}</span>{isCoreConcept && <span title="widely-known concept (one of 4960 OMWN core concepts)" className="ml-1 cursor-help">✪</span>}{' · '}
                                                         {concept.da ? renderDefinitionWithLinks(mainDef, concept.da) : mainDef}
                                                         {<LangBadge lang={shownLang} currentLang={definitionLanguage} />}
                                                         {concept.dr?.[shownLang] && renderProvenance('definitions', concept.dr[shownLang])}
@@ -2316,7 +2556,19 @@
                                                     </div>
                                                     {relationsView === 'graph' && <div style={{ position: 'relative', overflow: 'hidden' }}>
                                                         <div id="concept-graph" style={{ width: '100%', height: '500px' }} />
-                                                        <div className="text-sm text-gray-600 italic mt-2">Hover over a node to expand its relations.</div>
+                                                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs mt-2">
+                                                            <span className="text-gray-500 italic flex-shrink-0">Hover a node to expand its relations.</span>
+                                                            {concept.cr && [...new Set(concept.cr.map(r => r.t))].map(type => {
+                                                                const short = RELATION_TO_SHORT[type];
+                                                                const color = _relColors[short] || _relColors[type] || '#999';
+                                                                return (
+                                                                    <span key={type} className="flex items-center gap-1 whitespace-nowrap">
+                                                                        <svg width="10" height="10" className="flex-shrink-0"><circle cx="5" cy="5" r="4" fill={color} /></svg>
+                                                                        <span className="text-gray-600">{getRelLabel(type)}</span>
+                                                                    </span>
+                                                                );
+                                                            })}
+                                                        </div>
                                                         {hoveredNode && hoverMenuPosition && (
                                                             <div style={{
                                                                 position: 'absolute', left: hoverMenuPosition.x, top: hoverMenuPosition.y,
@@ -2366,11 +2618,14 @@
                                                                         const li = getConceptLabel(parseInt(rel.to), definitionLanguage);
                                                                         return (
                                                                             <span key={rel.to} className="inline-flex items-baseline gap-0.5">
-                                                                                <button onClick={() => handleConceptClick(rel.to)}
+                                                                                <a href={conceptHref(rel.to)}
+                                                                                    onClick={e => onConceptLinkClick(e, rel.to)}
+                                                                                    onMouseEnter={e => showTooltip(rel.to, e)}
+                                                                                    onMouseLeave={hideTooltip}
                                                                                     className="text-blue-600 hover:underline">
                                                                                     {li?.form || `#${rel.to}`}
                                                                                     {<LangBadge lang={li?.lang} currentLang={definitionLanguage} ml="ml-0.5" />}
-                                                                                </button>
+                                                                                </a>
                                                                                 {renderCompactProvenance('synsets', rel.to)}
                                                                             </span>
                                                                         );
@@ -2446,29 +2701,67 @@
                                                 return (
                                                 <div className="mb-4">
                                                     <h3 className="font-bold mb-2 text-base">Path to concept</h3>
-                                                    <div className="flex gap-2 mb-2 items-center">
-                                                        <input
-                                                            type="text"
-                                                            value={pathTargetIli}
-                                                            onChange={e => {
-                                                                const q = e.target.value.trim();
-                                                                setPathTargetIli(e.target.value);
-                                                                setPathResult(null);
-                                                                setPathNotFound(false);
-                                                                const norm = q.replace(/^cili\./, '');
-                                                                if (/^i\d+$/.test(norm)) {
-                                                                    const rows = cachedExec('SELECT rowid FROM synsets WHERE ili = ?', [norm]);
-                                                                    setPathTargetRowid(rows[0]?.rowid || null);
-                                                                } else {
-                                                                    setPathTargetRowid(null);
-                                                                }
-                                                            }}
-                                                            onKeyDown={e => { if (e.key === 'Enter' && pathTargetRowid) runPath(pathTargetRowid); }}
-                                                            placeholder={`e.g. i${fromIli?.replace(/^i/,'') || '46360'}`}
-                                                            className="w-40 border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-400 font-mono"
-                                                        />
+                                                    <div className="flex gap-2 mb-2 items-center flex-wrap">
+                                                        <div className="relative">
+                                                            <input
+                                                                type="text"
+                                                                value={pathTargetIli}
+                                                                onChange={e => {
+                                                                    const raw = e.target.value;
+                                                                    const q = raw.trim();
+                                                                    setPathTargetIli(raw);
+                                                                    setPathResult(null);
+                                                                    setPathNotFound(false);
+                                                                    setPathWordSuggestions([]);
+                                                                    const norm = q.replace(/^cili\./, '');
+                                                                    if (/^i\d+$/.test(norm)) {
+                                                                        const rows = cachedExec('SELECT rowid FROM synsets WHERE ili = ?', [norm]);
+                                                                        setPathTargetRowid(rows[0]?.rowid || null);
+                                                                    } else if (q.length >= 2) {
+                                                                        setPathTargetRowid(null);
+                                                                        const lang = definitionLanguage || 'en';
+                                                                        const rows = cachedExec(
+                                                                            `SELECT DISTINCT syn.rowid, f.form, syn.pos,
+                                                                                    (SELECT d.definition FROM definitions d
+                                                                                     JOIN languages l ON l.rowid = d.language_rowid
+                                                                                     WHERE d.synset_rowid = syn.rowid AND l.code = ?
+                                                                                     LIMIT 1) AS def
+                                                                             FROM forms f
+                                                                             JOIN entries e ON e.rowid = f.entry_rowid
+                                                                             JOIN senses s ON s.entry_rowid = e.rowid
+                                                                             JOIN synsets syn ON syn.rowid = s.synset_rowid
+                                                                             WHERE f.normalized_form = lower(?)
+                                                                             ORDER BY syn.pos, syn.rowid LIMIT 8`,
+                                                                            [lang, q]
+                                                                        );
+                                                                        setPathWordSuggestions(rows);
+                                                                    } else {
+                                                                        setPathTargetRowid(null);
+                                                                    }
+                                                                }}
+                                                                onKeyDown={e => { if (e.key === 'Enter' && pathTargetRowid) runPath(pathTargetRowid); if (e.key === 'Escape') setPathWordSuggestions([]); }}
+                                                                placeholder="word or ILI (e.g. dog, i46360)"
+                                                                className="w-52 border border-gray-300 rounded px-2 py-1 text-sm focus:outline-none focus:border-blue-400"
+                                                            />
+                                                            {pathWordSuggestions.length > 0 && (
+                                                                <div className="absolute z-50 top-full left-0 mt-1 w-80 bg-white border border-gray-300 rounded shadow-lg text-sm max-h-48 overflow-y-auto">
+                                                                    {pathWordSuggestions.map((s, i) => (
+                                                                        <button key={i} className="w-full text-left px-3 py-1.5 hover:bg-blue-50 flex gap-2 items-baseline"
+                                                                            onMouseDown={e => { e.preventDefault();
+                                                                                setPathTargetRowid(s.rowid);
+                                                                                setPathTargetIli(s.form);
+                                                                                setPathWordSuggestions([]);
+                                                                            }}>
+                                                                            <span className="font-medium text-gray-800">{s.form}</span>
+                                                                            <span className="text-gray-400 italic text-xs">{getPosName(s.pos)}</span>
+                                                                            {s.def && <span className="text-gray-500 truncate text-xs">{s.def.length > 60 ? s.def.slice(0,60)+'…' : s.def}</span>}
+                                                                        </button>
+                                                                    ))}
+                                                                </div>
+                                                            )}
+                                                        </div>
                                                         {targetLabel && <span className="text-sm text-gray-600">{targetLabel.form}{<LangBadge lang={targetLabel.lang} currentLang={definitionLanguage} />}</span>}
-                                                        {pathTargetIli && !pathTargetRowid && <span className="text-xs text-gray-400 italic">not found</span>}
+                                                        {pathTargetIli && !pathTargetRowid && pathWordSuggestions.length === 0 && <span className="text-xs text-gray-400 italic">not found</span>}
                                                         <button
                                                             onClick={() => pathTargetRowid && runPath(pathTargetRowid)}
                                                             disabled={!pathTargetRowid}
@@ -2486,12 +2779,14 @@
                                                                         {i > 0 && step.rel && (
                                                                             <span className="text-gray-400 text-xs italic whitespace-nowrap">—{getRelLabel(step.rel)}→</span>
                                                                         )}
-                                                                        <button
-                                                                            onClick={() => handleConceptClick(step.node)}
+                                                                        <a href={conceptHref(step.node)}
+                                                                            onClick={e => onConceptLinkClick(e, step.node)}
+                                                                            onMouseEnter={e => showTooltip(step.node, e)}
+                                                                            onMouseLeave={hideTooltip}
                                                                             className={`px-1.5 py-0.5 rounded text-xs border ${step.node === parseInt(selectedConcept) ? 'bg-blue-100 border-blue-400 text-blue-800 font-semibold' : 'bg-white border-gray-300 text-blue-600 hover:border-blue-400'}`}>
                                                                             {li?.form || `#${step.node}`}
                                                                             {<LangBadge lang={li?.lang} currentLang={definitionLanguage} ml="ml-0.5" />}
-                                                                        </button>
+                                                                        </a>
                                                                     </React.Fragment>
                                                                 );
                                                             })}
@@ -2556,7 +2851,8 @@
                                                     <div className="text-base text-gray-500 mb-1">
                                                         {sense.p.map((p, i) => (
                                                             <span key={i} className="mr-3">
-                                                                /{p.pronunciation}/{p.variety && <span className="text-xs ml-1">{p.variety}</span>}
+                                                                {p.pronunciation && <span title={p.variety || undefined}>/{p.pronunciation}/</span>}
+                                                                {p.audio && <button onClick={() => new Audio(p.audio).play()} title={p.variety || 'Play audio'} className="ml-1 hover:text-blue-500">🔊</button>}
                                                             </span>
                                                         ))}
                                                     </div>
@@ -2575,7 +2871,22 @@
                                             )}
                                             <div className="mb-4">
                                                 <h3 className="font-bold mb-2">Concept:</h3>
-                                                <button onClick={() => handleConceptClick(sense.c)} className="text-blue-600 hover:underline">{sense.c}</button>
+                                                {(() => {
+                                                    const cid = sense.c?.toString();
+                                                    const li = cid ? getConceptLabel(parseInt(cid), definitionLanguage) : null;
+                                                    const cd = cid ? (getConceptData(cid) || loadConcept(cid)) : null;
+                                                    const [def] = cd ? selectDef(cd.d, definitionLanguage, '') : [''];
+                                                    return (
+                                                        <a href={conceptHref(sense.c)}
+                                                            onClick={e => onConceptLinkClick(e, sense.c)}
+                                                            onMouseEnter={e => showTooltip(sense.c, e)}
+                                                            onMouseLeave={hideTooltip}
+                                                            className="text-blue-600 hover:underline">
+                                                            {li?.form || sense.c}
+                                                            {li && <span className="text-gray-500 font-normal"> · <span className="italic">{getPosName(cd?.oc)}</span>{def ? ' · ' + (def.length > 100 ? def.slice(0,100)+'…' : def) : ''}</span>}
+                                                        </a>
+                                                    );
+                                                })()}
                                             </div>
                                             {sense.ex && sense.ex.length > 0 && (
                                                 <div className="mb-4">
@@ -2591,12 +2902,19 @@
                                                 <div className="mb-4">
                                                     <h3 className="font-bold mb-2">Sense Relations:</h3>
                                                     <div className="ml-2 space-y-1 text-sm">
-                                                        {sense.sr.map((rel, i) => (
-                                                            <div key={i}>
-                                                                <span className="text-gray-600">{getRelLabel(rel.t)}:</span>{' '}
-                                                                <button onClick={() => handleSenseClick(rel.to)} className="text-blue-600 hover:underline">{rel.to}</button>
-                                                            </div>
-                                                        ))}
+                                                        {sense.sr.map((rel, i) => {
+                                                            const toSense = loadedSenses[rel.to.toString()] ?? querySense(parseInt(rel.to));
+                                                            return (
+                                                                <div key={i}>
+                                                                    <span className="text-gray-600">{getRelLabel(rel.t)}:</span>{' '}
+                                                                    <a href={senseHref(rel.to)}
+                                                                        onClick={e => onSenseLinkClick(e, rel.to)}
+                                                                        className="text-blue-600 hover:underline">
+                                                                        {toSense?.l || rel.to}
+                                                                    </a>
+                                                                </div>
+                                                            );
+                                                        })}
                                                     </div>
                                                 </div>
                                             )}
@@ -2697,7 +3015,7 @@
                                             if (confirm('Clear cached database? It will be re-downloaded on next page load.')) {
                                                 await idbClear();
                                                 _provDb = null;
-                                                location.reload();
+                                                location.href = location.pathname;
                                             }
                                         }}
                                         className="text-sm text-red-600 hover:text-red-800 underline"
@@ -2759,6 +3077,180 @@
                                 if (url === 'wordnet') return 'WordNet';
                                 return url;
                             };
+
+                            if (selectedWordnet) {
+                                const r = allResources.find(res => res.code === selectedWordnet);
+                                if (!r) return <p className="text-gray-600">Wordnet not found.</p>;
+                                const summary = provenanceReady ? queryWordnetSummary(r.code, r.language) : null;
+                                const extra = (() => { try { return r.extra ? JSON.parse(r.extra) : null; } catch(e) { return null; } })();
+                                const metaRows = [
+                                    ['ID',         r.code],
+                                    ['Version',    r.version],
+                                    ['URL',        r.url],
+                                    ['Licence',    r.licence],
+                                    ['Email',      r.email],
+                                    ['Status',     r.status],
+                                    ['Confidence', r.confidence_score != null ? r.confidence_score : null],
+                                    ['Citation',   r.citation],
+                                    ...(extra ? Object.entries(extra).map(([k, v]) => [k.replace(/^.*[/:}]/, ''), v]) : []),
+                                ].filter(([, v]) => v != null && v !== '');
+                                const byPos = {};
+                                (summary?.examples || []).forEach(e => {
+                                    if (!byPos[e.pos]) byPos[e.pos] = [];
+                                    byPos[e.pos].push(e);
+                                });
+                                return (
+                                <div data-testid="wordnet-summary">
+                                    <button onClick={() => setSelectedWordnet(null)}
+                                            className="text-sm text-blue-600 hover:underline mb-4 block">
+                                        ← Back to Wordnets
+                                    </button>
+                                    <h2 className="text-xl font-bold mb-1">{r.label || r.code}</h2>
+                                    {r.language && <p className="text-sm text-gray-500 mb-4">{getLangFullName(r.language)} ({r.language})</p>}
+
+                                    <div className="border-t border-gray-200 pt-4 mb-4">
+                                        <h3 className="font-medium text-sm text-gray-700 mb-2">Metadata</h3>
+                                        <dl className="grid grid-cols-[8rem_1fr] gap-x-2 gap-y-1 text-sm">
+                                            {metaRows.map(([label, value]) => (
+                                                <React.Fragment key={label}>
+                                                    <dt className="font-medium text-gray-500">{label}</dt>
+                                                    <dd className="text-gray-800 break-words">
+                                                        {/^https?:\/\//.test(value)
+                                                            ? <a href={value} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{value}</a>
+                                                            : String(value)}
+                                                    </dd>
+                                                </React.Fragment>
+                                            ))}
+                                        </dl>
+                                    </div>
+
+                                    <div className="border-t border-gray-200 pt-4 mb-4">
+                                        <h3 className="font-medium text-sm text-gray-700 mb-3">Coverage</h3>
+                                        <div className={`grid gap-3 mb-4 ${summary ? 'grid-cols-2 sm:grid-cols-5' : 'grid-cols-2'}`}>
+                                            {[
+                                                ['Concepts',    r.synset_count],
+                                                ['Senses',      r.sense_count],
+                                                ...(summary ? [
+                                                    ['ILI %',       summary.iliPct != null ? `${summary.iliPct}%` : null],
+                                                    ['Definitions', summary.defCount],
+                                                    ['Examples',    summary.exCount],
+                                                ] : []),
+                                            ].filter(([, n]) => n != null).map(([label, n]) => (
+                                                <div key={label} className="bg-gray-50 rounded p-3 text-center">
+                                                    <div className="text-lg font-semibold text-gray-800">{typeof n === 'number' ? n.toLocaleString() : n}</div>
+                                                    <div className="text-xs text-gray-500 mt-0.5">{label}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                        {summary?.posStats && (
+                                            <table className="w-full text-sm border-collapse">
+                                                <thead>
+                                                    <tr className="bg-gray-100 text-left">
+                                                        <th className="px-3 py-2 border border-gray-200">Part of speech</th>
+                                                        <th className="px-3 py-2 border border-gray-200 text-right">Concepts</th>
+                                                        <th className="px-3 py-2 border border-gray-200 text-right">With ILI</th>
+                                                        <th className="px-3 py-2 border border-gray-200">Examples</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {summary.posStats.map((row, i) => (
+                                                        <tr key={row.pos} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                            <td className="px-3 py-2 border border-gray-200">{posToHumanReadable[row.pos] || row.pos}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{row.cnt.toLocaleString()}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{row.withIli.toLocaleString()}</td>
+                                                            <td className="px-3 py-2 border border-gray-200">
+                                                                <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                                                                    {(byPos[row.pos] || []).map((item, j) => (
+                                                                        <a key={j}
+                                                                            href={conceptHref(item.synset_rowid)}
+                                                                            onClick={e => { onConceptLinkClick(e, item.synset_rowid); setActiveTab('browser'); }}
+                                                                            onMouseEnter={e => showTooltip(item.synset_rowid, e)}
+                                                                            onMouseLeave={hideTooltip}
+                                                                            className="text-blue-600 hover:underline">
+                                                                            {item.form}
+                                                                        </a>
+                                                                    ))}
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        )}
+                                        {!provenanceReady && <p className="text-xs text-gray-400 mt-2">Load the provenance database for detailed statistics.</p>}
+                                    </div>
+
+                                    {summary && summary.relDist.length > 0 && (
+                                        <div className="border-t border-gray-200 pt-4 mb-4">
+                                            <h3 className="font-medium text-sm text-gray-700 mb-3">Semantic relations</h3>
+                                            <table className="w-full text-sm border-collapse">
+                                                <thead>
+                                                    <tr className="bg-gray-100 text-left">
+                                                        <th className="px-3 py-2 border border-gray-200">Relation</th>
+                                                        <th className="px-3 py-2 border border-gray-200 text-right">Count</th>
+                                                        <th className="px-3 py-2 border border-gray-200">Example</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {summary.relDist.map((row, i) => {
+                                                        const srcLabel = row.ex_src_rowid ? getConceptLabel(row.ex_src_rowid, r.language)?.form : null;
+                                                        const tgtLabel = row.ex_tgt_rowid ? getConceptLabel(row.ex_tgt_rowid, r.language)?.form : null;
+                                                        return (
+                                                        <tr key={row.type} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                            <td className="px-3 py-2 border border-gray-200">{getRelLabel(row.type)}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{row.cnt.toLocaleString()}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-xs">
+                                                                {srcLabel && tgtLabel ? (
+                                                                    <>
+                                                                        <a href={conceptHref(row.ex_src_rowid)} onClick={e => { onConceptLinkClick(e, row.ex_src_rowid); setActiveTab('browser'); }} onMouseEnter={e => showTooltip(row.ex_src_rowid, e)} onMouseLeave={hideTooltip} className="text-blue-600 hover:underline">{srcLabel}</a>
+                                                                        {' → '}
+                                                                        <a href={conceptHref(row.ex_tgt_rowid)} onClick={e => { onConceptLinkClick(e, row.ex_tgt_rowid); setActiveTab('browser'); }} onMouseEnter={e => showTooltip(row.ex_tgt_rowid, e)} onMouseLeave={hideTooltip} className="text-blue-600 hover:underline">{tgtLabel}</a>
+                                                                    </>
+                                                                ) : <span className="text-gray-400">—</span>}
+                                                            </td>
+                                                        </tr>
+                                                        );
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+
+                                    {summary && summary.senseRelDist.length > 0 && (
+                                        <div className="border-t border-gray-200 pt-4 mb-4">
+                                            <h3 className="font-medium text-sm text-gray-700 mb-3">Sense relations</h3>
+                                            <table className="w-full text-sm border-collapse">
+                                                <thead>
+                                                    <tr className="bg-gray-100 text-left">
+                                                        <th className="px-3 py-2 border border-gray-200">Relation</th>
+                                                        <th className="px-3 py-2 border border-gray-200 text-right">Count</th>
+                                                        <th className="px-3 py-2 border border-gray-200">Example</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {summary.senseRelDist.map((row, i) => (
+                                                        <tr key={row.type} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                                            <td className="px-3 py-2 border border-gray-200">{getRelLabel(row.type)}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{row.cnt.toLocaleString()}</td>
+                                                            <td className="px-3 py-2 border border-gray-200 text-xs">
+                                                                {row.src_form && row.tgt_form ? (
+                                                                    <>
+                                                                        <a href={senseHref(row.ex_src_rowid)} onClick={e => { onSenseLinkClick(e, row.ex_src_rowid); setActiveTab('browser'); }} className="text-blue-600 hover:underline">{row.src_form}</a>
+                                                                        {' → '}
+                                                                        <a href={senseHref(row.ex_tgt_rowid)} onClick={e => { onSenseLinkClick(e, row.ex_tgt_rowid); setActiveTab('browser'); }} className="text-blue-600 hover:underline">{row.tgt_form}</a>
+                                                                    </>
+                                                                ) : <span className="text-gray-400">—</span>}
+                                                            </td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+                                );
+                            }
+
                             const sortResources = (col) => setWnSort(s => ({ col, asc: s.col === col ? !s.asc : true }));
                             const sortedResources = (() => {
                                 if (!wnSort.col) return allResources;
@@ -2794,8 +3286,7 @@
                                         <tbody>
                                             {sortedResources.map((r, i) => (
                                                 <tr key={r.code + '|' + i}
-                                                    ref={r.code === highlightedResource ? highlightedRowRef : null}
-                                                    className={r.code === highlightedResource ? 'bg-yellow-100' : (i % 2 === 0 ? 'bg-white' : 'bg-gray-50')}>
+                                                    className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                                                     <td className="px-3 py-2 border border-gray-200 whitespace-nowrap">
                                                         {r.language
                                                             ? <span title={r.language} className="cursor-help">{getLangFullName(r.language)}</span>
@@ -2805,9 +3296,19 @@
                                                         {r.url
                                                             ? <a href={r.url} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{r.label || r.code}</a>
                                                             : (r.label || r.code)}
-                                                        <button onClick={() => setInfoPopup(r)}
-                                                                className="float-right text-blue-600 hover:text-blue-800"
-                                                                title="Show full metadata">ⓘ</button>
+                                                        <span className="float-right relative group/wni">
+                                                            <button onClick={() => setSelectedWordnet(r.code)}
+                                                                    className="text-blue-600 hover:text-blue-800"
+                                                                    title="Show wordnet summary">ⓘ</button>
+                                                            <div className="absolute right-0 top-full mt-1 hidden group-hover/wni:block bg-white border border-gray-200 rounded shadow-lg p-3 text-xs text-gray-700 z-40 w-56 space-y-1">
+                                                                {r.version && <div><span className="text-gray-500">Version:</span> {r.version}</div>}
+                                                                {r.language && <div><span className="text-gray-500">Language:</span> {getLangFullName(r.language)}</div>}
+                                                                {r.licence && <div><span className="text-gray-500">Licence:</span> {r.licence.startsWith('http') ? <a href={r.licence} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{shortLicence(r.licence)}</a> : shortLicence(r.licence)}</div>}
+                                                                {r.synset_count != null && <div><span className="text-gray-500">Concepts:</span> {r.synset_count.toLocaleString()}</div>}
+                                                                {r.sense_count != null && <div><span className="text-gray-500">Senses:</span> {r.sense_count.toLocaleString()}</div>}
+                                                                <div className="pt-1 border-t border-gray-100 text-gray-400 italic">Click for full summary (may be slow)</div>
+                                                            </div>
+                                                        </span>
                                                     </td>
                                                     <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{r.synset_count != null ? r.synset_count.toLocaleString() : '—'}</td>
                                                     <td className="px-3 py-2 border border-gray-200 text-right tabular-nums">{r.sense_count != null ? r.sense_count.toLocaleString() : '—'}</td>
@@ -2832,67 +3333,50 @@
                         })()}
                     </main>
 
+                    {siteConfig.footer && (
                     <footer className="mt-auto py-4">
-                        <div className="max-w-4xl mx-auto px-4 border-t border-gray-200 pt-4">
-                            {siteConfig.footer
-                                ? <div className="max-w-4xl mx-auto text-center text-sm text-gray-600"
-                                       dangerouslySetInnerHTML={{ __html: siteConfig.footer }} />
-                                : <div className="max-w-4xl mx-auto text-center text-sm text-gray-600">
-                                    <div className="mb-2">
-                                        <span>Produced with the support of</span>
-                                    </div>
-                                    <div>
-                                        <a href="https://www.culturelab.psl.eu/" target="_blank" rel="noopener noreferrer" className="inline-block hover:opacity-80">
-                                            <img src="culturelab.png" alt="Culture Lab" className="h-14 inline-block" />
-                                        </a>
-                                    </div>
-                                  </div>
+                        <div className="max-w-4xl mx-auto px-4 border-t border-gray-200 pt-4 text-center text-sm text-gray-600">
+                            {typeof siteConfig.footer === 'string'
+                                ? <div dangerouslySetInnerHTML={{ __html: siteConfig.footer }} />
+                                : <>
+                                    {siteConfig.footer.text && <div className="mb-2">{siteConfig.footer.text}</div>}
+                                    {siteConfig.footer.logos?.length > 0 && (
+                                        <div className="flex items-center justify-center gap-6 flex-wrap">
+                                            {siteConfig.footer.logos.map((logo, i) => (
+                                                logo.url
+                                                    ? <a key={i} href={logo.url} target="_blank" rel="noopener noreferrer" className="inline-block hover:opacity-80">
+                                                          <img src={logo.src} alt={logo.alt || ''} style={{height: logo.height || '3.5rem'}} className="inline-block" />
+                                                      </a>
+                                                    : <img key={i} src={logo.src} alt={logo.alt || ''} style={{height: logo.height || '3.5rem'}} className="inline-block" />
+                                            ))}
+                                        </div>
+                                    )}
+                                  </>
                             }
                         </div>
                     </footer>
+                    )}
 
-                    {infoPopup && (() => {
-                        const r = infoPopup;
-                        const extra = (() => { try { return r.extra ? JSON.parse(r.extra) : null; } catch(e) { return null; } })();
-                        const rows = [
-                            ['ID',          r.code],
-                            ['Language',    r.language ? `${getLangFullName(r.language)} (${r.language})` : null],
-                            ['Version',     r.version],
-                            ['URL',         r.url],
-                            ['Licence',     r.licence],
-                            ['Email',       r.email],
-                            ['Status',      r.status],
-                            ['Confidence',  r.confidence_score != null ? r.confidence_score : null],
-                            ['Citation',    r.citation],
-                            ...(extra ? Object.entries(extra).map(([k, v]) => [k.replace(/^.*[/:}]/, ''), v]) : []),
-                        ].filter(([, v]) => v != null && v !== '');
-                        return (
-                            <div className="fixed inset-0 z-50 flex items-center justify-center"
-                                 onClick={() => setInfoPopup(null)}>
-                                <div className="absolute inset-0 bg-black opacity-40" />
-                                <div className="relative bg-white rounded-lg shadow-xl w-full max-w-lg mx-4 p-6 max-h-[80vh] overflow-y-auto"
-                                     onClick={e => e.stopPropagation()}>
-                                    <div className="flex items-start justify-between mb-4">
-                                        <h3 className="text-lg font-bold text-gray-900">{r.label || r.code}</h3>
-                                        <button onClick={() => setInfoPopup(null)}
-                                                className="text-gray-400 hover:text-gray-600 text-xl leading-none ml-4">✕</button>
-                                    </div>
-                                    <dl className="space-y-2 text-sm">
-                                        {rows.map(([label, value]) => (
-                                            <div key={label} className="grid grid-cols-[7rem_1fr] gap-2">
-                                                <dt className="font-medium text-gray-500">{label}</dt>
-                                                <dd className="text-gray-800 break-words">
-                                                    {/^https?:\/\//.test(value)
-                                                        ? <a href={value} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">{value}</a>
-                                                        : value}
-                                                </dd>
-                                            </div>
-                                        ))}
-                                    </dl>
-                                </div>
-                            </div>
-                        );
-                    })()}
+                {conceptTooltip && (() => {
+                    const ct = conceptTooltip;
+                    const concept = getConceptData(ct.id.toString());
+                    if (!concept) return null;
+                    const [def] = selectDef(concept.d, definitionLanguage, '');
+                    const li = getConceptLabel(ct.id, definitionLanguage);
+                    const allSenseIds = concept.s ? Object.values(concept.s).flat().map(s => s.toString()) : [];
+                    const firstEx = allSenseIds.map(sid => loadedSenses[sid]?.ex?.[0]).find(Boolean);
+                    const left = Math.min(ct.x + 14, window.innerWidth - 300);
+                    const top = ct.y + 16;
+                    return (
+                        <div style={{ position: 'fixed', left, top, zIndex: 9999, maxWidth: 280, pointerEvents: 'none' }}
+                             className="bg-white border border-gray-300 rounded shadow-lg px-3 py-2 text-sm">
+                            {li && <div className="font-semibold text-gray-800">{li.form}</div>}
+                            <div className="text-gray-500 italic text-xs">{getPosName(concept.oc)}</div>
+                            {def && <div className="text-gray-700 mt-1">{def.length > 160 ? def.slice(0, 160) + '…' : def}</div>}
+                            {firstEx && <div className="text-gray-500 italic mt-0.5 text-xs">"{firstEx}"</div>}
+                        </div>
+                    );
+                })()}
                 </div>
             );
         }

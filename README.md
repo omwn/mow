@@ -1,12 +1,47 @@
-# About Myanmar Open Wordnet (MOW)
+# Myanmar Open Wordnet (MOW)
 
-Myanmar Open Wordnet (MOW) is a freely-available semantic dictionary of the Myanmar/Burmese language. It is inspired by the Princeton Wordnet and the Global WordNet Grid, and is part of the Open Multilingual Wordnet.
+The Myanmar Open Wordnet (MOW) is a freely-available semantic dictionary of the
+Myanmar/Burmese language, part of the
+[Open Multilingual Wordnet](https://omwn.org).
+It is built using the *expand* approach from Princeton WordNet synsets.
 
-Visit the official MOW website (wordnet.burmese.sg) for more information.
+Browse the wordnet at **https://omwn.github.io/mow/**.
 
-As an open wordnet, it is under the Creative Commons Attribution 4.0 International License (CC BY 4.0)
+## Data
 
-# Myanmar Open Wordnet (MOW) Repository
-This is the official repository for Myanmar Open Wordnet (MOW). At present, it's just a convenient place to download releases, which are tab-separated files (.tab format). The .tab files are named as such: ``mow-<version>-mya_<datetime:yyyymmddhhmmss>.tab``
+- Language: Myanmar/Burmese (`my`)
+- Version: 0.1.3
+- Source tab file: `mow-0.1.3-mya_20171005165336.tab`
+- Licence: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 
-(At present there is only one release. In future, the latest release will be in the top directory, while older releases will be kept in the "Previous Releases" folder)
+## Citation
+
+Wenjie Wang. n.d. Myanmar Open Wordnet (MOW). <https://wordnet.burmese.sg/>
+
+## Using with the `wn` module
+
+```python
+import wn
+wn.download("https://github.com/omwn/mow/releases/latest/download/wnmow.tar.xz")
+words = wn.words("ကုမ္ပဏီ", lang="my")
+```
+
+## Build
+
+Prerequisites: `uv`, `wget`, `xmlstarlet`, Python 3.11+.
+Requires a local clone of [cygnet](https://github.com/omwn/cygnet) at `../cygnet`.
+
+```bash
+bash build.sh      # produces docs/ web UI + build/wnmow-*.tar.xz
+bash run.sh        # serve docs/ locally for testing
+```
+
+## Release
+
+1. Run `bash build.sh` to produce fresh DB files and the LMF tarball.
+2. Create a GitHub release and upload:
+   - `build/wnmow-VERSION.tar.xz`
+   - `docs/mya-cygnet.db.gz`
+   - `docs/mya-provenance.db.gz`
+3. In **Settings → Pages**, set source to **GitHub Actions**.
+4. The Pages workflow fires automatically on release and deploys the web UI.
