@@ -2,7 +2,10 @@
 #
 # build.sh — Build the Myanmar Open Wordnet package and Cygnet databases.
 #
-# Usage: bash build.sh
+# Usage: bash build.sh [--rebuild]
+#   --rebuild   Wipe the cygnet work directory first (forces re-download of
+#               all wordnets — use when wordnets.toml URLs have changed)
+#
 # Produces:
 #   build/wnmow-VERSION.tar.xz     — WordNet LMF package
 #   docs/mya-cygnet.db.gz          — Cygnet main database
@@ -18,6 +21,12 @@ TAB_FILE="mow-0.1.3-mya_20171005165336.tab"
 DTD="WN-LMF-1.4.dtd"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CYGNET_DIR="$(cd "$PROJECT_DIR/../cygnet" && pwd)"
+CYGNET_WORK="$PROJECT_DIR/build/cygnet-work"
+
+if [[ "${1:-}" == "--rebuild" ]]; then
+    echo "Cleaning cygnet work directory for full rebuild..."
+    rm -rf "$CYGNET_WORK"
+fi
 
 DESCRIPTION="The Myanmar Open Wordnet (MOW) is a freely-available semantic \
 dictionary of the Myanmar/Burmese language, part of the Open Multilingual Wordnet. \
@@ -94,8 +103,6 @@ tar -c -J -f "build/${NAME}.tar.xz" "$DIR"
 # ============================================================
 # CYGNET DATABASE BUILD
 # ============================================================
-CYGNET_WORK="$PROJECT_DIR/build/cygnet-work"
-
 echo ""
 echo "=== Building Cygnet databases ==="
 
